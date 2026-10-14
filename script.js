@@ -224,23 +224,30 @@ document.addEventListener(
    pressed" is both the polite default and the only reliable one.
 
    THE SWAP POINT: every sound is made inside playTick() and
-   playClick(). Today they synthesize placeholder sounds; when
-   real samples arrive, only the insides of those two functions
-   change. Nothing that calls them needs to know.
+   playClick(). Each plays a recorded sample from /audio when
+   one is loaded and falls back to a synthesized sound when not.
+   Nothing that calls them needs to know which it got.
    ------------------------------------------------------------ */
 
 // Sound knobs, named like the typing knobs above. The tick numbers come
 // from measuring a real Pip-Boy boot recording: a short noise click
-// peaking near 3.4 kHz, never closer together than about 45 ms. The site
-// prints a character every 25–28 ms, so ticking on every character
-// would blur into a buzz; the minimum gap thins them to the hardware's
-// rhythm instead. Tuned down from the measured 3.4 kHz / 45 ms after
-// Taylor heard it on a phone: too high and too fast.
-const TICK_MIN_GAP_MS = 85;
+// peaking near 3.4 kHz, sounding on roughly every one or two characters.
+// (Tuned down to 2.4 kHz after Taylor heard it on a phone: too high.)
+//
+// Ticks follow the text: each printed character rolls the dice and
+// ticks with a chance between TICK_CHANCE_MIN and TICK_CHANCE_MAX (the
+// chance itself is re-drawn every character). Slow boot text ticks
+// slowly, fast home-screen text ticks quickly, and because every roll
+// is fresh, the rhythm never repeats. Pitch, volume and length all
+// wobble per tick for the same reason: no two ticks are identical.
+const TICK_CHANCE_MIN = 0.5;
+const TICK_CHANCE_MAX = 0.7;
 const TICK_LENGTH_S = 0.015;   // one tick: a 15 ms burst of noise
 const TICK_PITCH_HZ = 2400;    // centre of the tick's narrow band
 const TICK_PITCH_JITTER_HZ = 200; // per-tick wobble so it never sounds looped
 const TICK_VOLUME = 0.25;
+const TICK_VOLUME_JITTER = 0.2;      // each tick is 80–120% of TICK_VOLUME
+const TICK_LENGTH_JITTER = 0.3;      // each tick is 70–130% of TICK_LENGTH_S
 const CLICK_LENGTH_S = 0.04;   // the select chirp: a 40 ms falling square
 const CLICK_START_HZ = 700;
 const CLICK_END_HZ = 450;
@@ -254,13 +261,81 @@ let audioContext = null;
 // The single source of truth for "should anything make noise".
 let speakerOn = false;
 
-// When the last tick played, in AudioContext seconds — used to enforce
-// TICK_MIN_GAP_MS.
-let lastTickTime = 0;
-
 // A reusable buffer of white noise, built once on first use. Every tick
 // plays a slice of it through a filter rather than generating fresh noise.
 let noiseBuffer = null;
+
+/* ---- Recorded sounds (optional, with automatic fallback) ----
+   The real terminal sounds live as small files in /audio, served from
+   this site's own address. They are listed here, and ONLY here: an empty
+   list means "no recordings", so nothing is fetched and the synthesized
+   sounds below play exactly as before. Removing the files later means
+   emptying these lists again (reverting the commit that filled them).
+
+   Nothing is downloaded until the visitor turns the speaker on, so a
+   visitor who never wants sound never pays for the files. If any file
+   fails to load or decode it is simply left out; if none load, the
+   synthesized sounds keep playing. Either way, no visitor ever hears
+   silence because a file went missing. */
+const SAMPLE_TICK_FILES = [];  // several short variants, picked at random
+const SAMPLE_CLICK_FILES = []; // menu / enter clicks, picked at random
+const SAMPLE_RATE_JITTER = 0.06; // each sample plays at 94–106% speed
+const SAMPLE_VOLUME = 0.5;
+
+// Decoded recordings, filled in by loadSamples(). Empty means fallback.
+const tickSamples = [];
+const clickSamples = [];
+
+// The one load attempt, or null until the speaker is first turned on.
+let samplesRequested = false;
+
+// Fetch and decode every listed file into `into`. Each file stands
+// alone: one bad file never stops the others, and a failure is quietly
+// ignored because the synthesized sound is always there to cover it.
+function loadSampleList(paths, into) {
+  for (const path of paths) {
+    fetch(path)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("missing " + path);
+        }
+        return response.arrayBuffer();
+      })
+      .then((bytes) => audioContext.decodeAudioData(bytes))
+      .then((buffer) => into.push(buffer))
+      .catch(() => {
+        // Fallback: this file just isn't used.
+      });
+  }
+}
+
+// Called from the toggle's click the first time the speaker turns on.
+function loadSamples() {
+  if (samplesRequested) {
+    return;
+  }
+  samplesRequested = true;
+  loadSampleList(SAMPLE_TICK_FILES, tickSamples);
+  loadSampleList(SAMPLE_CLICK_FILES, clickSamples);
+}
+
+// Play one recording picked at random from `samples`, slightly faster or
+// slower each time (which also nudges its pitch), at a varied volume.
+// Returns false when there's nothing loaded, so the caller can fall back
+// to synthesis.
+function playRandomSample(samples, volume) {
+  if (samples.length === 0) {
+    return false;
+  }
+  const source = audioContext.createBufferSource();
+  source.buffer = samples[Math.floor(Math.random() * samples.length)];
+  source.playbackRate.value = randomBetween(1 - SAMPLE_RATE_JITTER, 1 + SAMPLE_RATE_JITTER);
+  const gain = audioContext.createGain();
+  gain.gain.value = volume;
+  source.connect(gain).connect(audioContext.destination);
+  source.start();
+  return true;
+}
 
 // Shape a sound's volume: a near-instant rise, then a quick fade to
 // silence. Without the fade every sound would end in an audible pop.
@@ -270,8 +345,14 @@ function envelope(gainNode, startTime, peak, lengthS) {
   gainNode.gain.exponentialRampToValueAtTime(0.0001, startTime + lengthS);
 }
 
-// One typing tick. Called for every printed character; whitespace and
-// the minimum gap decide whether this one actually sounds.
+// A random number between `low` and `high`. Every source of variation in
+// the ticks goes through here.
+function randomBetween(low, high) {
+  return low + Math.random() * (high - low);
+}
+
+// One typing tick. Called for every printed character; whitespace and a
+// fresh dice roll decide whether this one actually sounds.
 function playTick(character) {
   if (!speakerOn || !audioContext) {
     return;
@@ -279,15 +360,20 @@ function playTick(character) {
   if (character && character.trim() === "") {
     return; // a space isn't a keystroke on a terminal printer
   }
-  const now = audioContext.currentTime;
-  if (now - lastTickTime < TICK_MIN_GAP_MS / 1000) {
+  if (Math.random() >= randomBetween(TICK_CHANCE_MIN, TICK_CHANCE_MAX)) {
+    return; // this character prints silently
+  }
+  // Recorded tick if we have one; otherwise the synthesized stand-in.
+  if (playRandomSample(tickSamples, SAMPLE_VOLUME * randomBetween(1 - TICK_VOLUME_JITTER, 1 + TICK_VOLUME_JITTER))) {
     return;
   }
-  lastTickTime = now;
+  const now = audioContext.currentTime;
+  const lengthS = TICK_LENGTH_S * randomBetween(1 - TICK_LENGTH_JITTER, 1 + TICK_LENGTH_JITTER);
 
-  // --- placeholder synthesis (swap a sample in here later) ---
+  // --- synthesized fallback ---
   if (!noiseBuffer) {
-    const length = Math.ceil(audioContext.sampleRate * TICK_LENGTH_S);
+    // Long enough for the longest tick the length jitter can ask for.
+    const length = Math.ceil(audioContext.sampleRate * TICK_LENGTH_S * (1 + TICK_LENGTH_JITTER));
     noiseBuffer = audioContext.createBuffer(1, length, audioContext.sampleRate);
     const samples = noiseBuffer.getChannelData(0);
     for (let i = 0; i < length; i += 1) {
@@ -298,13 +384,14 @@ function playTick(character) {
   source.buffer = noiseBuffer;
   const band = audioContext.createBiquadFilter();
   band.type = "bandpass";
-  band.frequency.value = TICK_PITCH_HZ + (Math.random() * 2 - 1) * TICK_PITCH_JITTER_HZ;
+  band.frequency.value = TICK_PITCH_HZ + randomBetween(-1, 1) * TICK_PITCH_JITTER_HZ;
   band.Q.value = 4;
   const gain = audioContext.createGain();
-  envelope(gain, now, TICK_VOLUME * (0.8 + Math.random() * 0.4), TICK_LENGTH_S);
+  const volume = TICK_VOLUME * randomBetween(1 - TICK_VOLUME_JITTER, 1 + TICK_VOLUME_JITTER);
+  envelope(gain, now, volume, lengthS);
   source.connect(band).connect(gain).connect(audioContext.destination);
   source.start(now);
-  source.stop(now + TICK_LENGTH_S);
+  source.stop(now + lengthS);
 }
 
 // One UI click: menu selections and the speaker toggle itself.
@@ -312,7 +399,10 @@ function playClick() {
   if (!speakerOn || !audioContext) {
     return;
   }
-  // --- placeholder synthesis (swap a sample in here later) ---
+  if (playRandomSample(clickSamples, SAMPLE_VOLUME)) {
+    return;
+  }
+  // --- synthesized fallback ---
   const now = audioContext.currentTime;
   const tone = audioContext.createOscillator();
   tone.type = "square";
@@ -335,9 +425,10 @@ document.addEventListener("charprinted", (event) => {
 
 // The toggle. Its click is the user gesture browsers require before
 // sound: the AudioContext is born here, on the first press, and never
-// earlier. Each press flips the state, relabels the button, keeps the
+// earlier. Each press flips the state, updates aria-pressed, keeps the
 // boot log's AUDIO RELAY line honest, and (when turning on) clicks, so
-// the visitor hears that it worked.
+// the visitor hears that it worked. The icon needs no code: CSS swaps
+// waves for the X from aria-pressed alone.
 const speakerToggle = document.querySelector(".speaker-toggle");
 speakerToggle.hidden = false;
 speakerToggle.addEventListener("click", () => {
@@ -348,8 +439,10 @@ speakerToggle.addEventListener("click", () => {
   // resuming inside the gesture is what makes iOS Safari actually play.
   audioContext.resume();
   speakerOn = !speakerOn;
+  if (speakerOn) {
+    loadSamples(); // first time only; never before the speaker is on
+  }
   speakerToggle.setAttribute("aria-pressed", String(speakerOn));
-  speakerToggle.textContent = speakerOn ? "[ SPEAKER: ON ]" : "[ SPEAKER: OFF ]";
   updateAudioRelayLine();
   playClick();
 });
